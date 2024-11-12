@@ -6,3 +6,6 @@ pkg/
 wasm-pack.log
 src/
 tests/
+/index.html
+static/
+items.json
