@@ -8,3 +8,5 @@ tests/
 /index.html
 static/
 items.json
+.github
+.idea

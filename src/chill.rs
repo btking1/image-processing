@@ -1,15 +1,23 @@
-use ab_glyph::{Font, FontRef, Glyph, PxScale};
-use image::{GenericImageView, ImageBuffer, ImageError, ImageReader, Pixel};
-use image::{Rgb, Rgba};
+use ab_glyph::{FontRef, PxScale};
+use anyhow::Result;
+use image::codecs::gif::GifEncoder;
+use image::imageops::FilterType;
+use image::Rgba;
+use image::{Frame, GenericImageView, ImageBuffer, ImageReader};
 use imageproc::map::map_pixels_mut;
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fmt::Debug;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{Error, ErrorKind, Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct Chill {
@@ -100,7 +108,7 @@ impl Chill {
             }
         }
     }
-    pub fn save_image(chill: &Self, src: &String) -> Result<(), std::io::Error> {
+    pub fn save_image(chill: &Self, src: &String) -> Result<()> {
         let api_auth = format!("Authorization: {}", &chill.api_key);
         let outdir = &Chill::outdir(&chill).unwrap().0;
 
@@ -133,13 +141,10 @@ impl Chill {
             println!("SUCCESS -> {}", &image_path.to_string_lossy());
             Ok(())
         } else {
-            Err(Error::new(
-                ErrorKind::Other,
-                format!("ERROR -> failed to get image: {}", &src),
-            ))
+            anyhow::bail!("")
         }
     }
-    pub fn display(chill: &Self) -> Result<(), Error> {
+    pub fn display(chill: &Self) -> Result<()> {
         let browser = &chill.browser;
         let outdir = Chill::outdir(chill).unwrap().0;
         let src = outdir.join("chill-image-edit.jpg").clone();
@@ -151,10 +156,7 @@ impl Chill {
             .unwrap();
 
         if !&open.success() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("{:?}", &open.code()),
-            ))
+            anyhow::bail!("ERROR -> trying to open gif")
         } else {
             Ok(())
         }
@@ -237,6 +239,76 @@ impl Chill {
         let processed_image =
             imageproc::drawing::draw_text(&mut rgba_image, color, x, y, scale, &fira_code, text);
         processed_image
+    }
+
+    pub fn gif(chill: &Self) -> Result<(), anyhow::Error> {
+        let tt = Instant::now();
+        let outdir = Chill::outdir(&chill).unwrap();
+        let outpath = outdir.0.join("chill.gif");
+
+        let text = "hello world";
+
+        let pb = ProgressBar::new(text.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+                .unwrap()
+                .progress_chars("██░"),
+        );
+
+        // Create accumulating strings
+        let accumulated_strings: Vec<String> = text
+            .char_indices()
+            .map(|(i, _)| text[..=i].to_string())
+            .collect();
+
+        // 3. Parallel frame generation
+        let processed_frames: Vec<_> = accumulated_strings
+            .par_iter()
+            .map(|current_text| {
+                let delay = image::Delay::from_numer_denom_ms(500, 1);
+                let proc_image_buffer = Chill::swirl_and_add_text(&chill, current_text);
+
+                // 4. Optimize image size if possible
+                let resized_buffer = image::DynamicImage::ImageRgba8(proc_image_buffer)
+                    .resize(2700, 1600, FilterType::Lanczos3)
+                    .to_rgba8();
+
+                let frame = Frame::from_parts(resized_buffer, 0, 0, delay);
+
+                pb.inc(1);
+                frame
+            })
+            .collect();
+
+        pb.finish_with_message("Frames generated");
+
+        // 5. Efficient GIF encoding
+        println!("Starting GIF encoding...");
+        let gif_file = BufWriter::new(File::create(&outpath)?);
+        let mut encoder = GifEncoder::new(gif_file);
+        encoder.set_repeat(image::codecs::gif::Repeat::Infinite)?;
+
+        // 6. Use a separate thread for encoding
+        let (tx, rx) = mpsc::channel();
+        let encode_handle = thread::spawn(move || {
+            for frame in rx {
+                encoder.encode_frame(frame).unwrap();
+            }
+            anyhow::anyhow!("ERROR -> encoding frames")
+        });
+
+        // Send frames to encoder
+        for frame in processed_frames {
+            tx.send(frame)?;
+        }
+        drop(tx);
+
+        // Wait for encoding to complete
+        encode_handle.join().unwrap();
+
+        println!("Total time: {}s", tt.elapsed().as_secs());
+        Ok(())
     }
 
     pub fn read_from_json(chill: &Self) -> String {
